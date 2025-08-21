@@ -289,19 +289,19 @@ def main(input_csv, output_excel, alpha, window, top_n, tail_weights, blend_mark
 
         # Sanity checks
         fail_count = 0
-        sample_curr = random.sample(list(transitions.keys()), min(100, len(transitions)))
-        for curr in sample_curr:
+        trans_sample = random.sample(list(transitions.keys()), min(100, len(transitions)))
+        for curr in trans_sample:
             prob_sum = sum(transitions[curr].values())
             if not 0.99 < prob_sum < 1.01:
-                logger.warning(f"Prob sum {prob_sum} for {curr}")
+                logger.warning(f"Prob sum {prob_sum} for transitions {curr}")
                 fail_count += 1
-        sample_curr = random.sample(list(co_vis.keys()), min(100, len(co_vis)))
-        for curr in sample_curr:
+        cov_sample = random.sample(list(co_vis.keys()), min(100, len(co_vis)))
+        for curr in cov_sample:
             prob_sum = sum(co_vis[curr].values())
             if not 0.99 < prob_sum < 1.01:
-                logger.warning(f"Prob sum {prob_sum} for {curr}")
+                logger.warning(f"Prob sum {prob_sum} for co_vis {curr}")
                 fail_count += 1
-        logger.info(f"Sanity check: {fail_count} failures out of 200 samples")
+        logger.info(f"Sanity check: {fail_count} failures out of {len(trans_sample) + len(cov_sample)} samples")
 
         eval_start = time.time()
         acc, preds, _, num_backoff, correct_k, dom_markov, dom_cov, dom_tie = evaluate(sequences, transitions, co_vis, popularity, k, tail_weights,
@@ -351,7 +351,7 @@ def main(input_csv, output_excel, alpha, window, top_n, tail_weights, blend_mark
         last_transitions = transitions
         last_k = k
 
-    macro_acc = np.mean(list(results.values()))
+    macro_acc = np.mean(list(results.values())) if results else 0.0
     micro_acc = total_correct / total_eligible if total_eligible > 0 else 0
     results['Overall accuracy (macro – mean of per-k)'] = macro_acc
     results['Overall accuracy (micro – global)'] = micro_acc
@@ -386,6 +386,7 @@ def main(input_csv, output_excel, alpha, window, top_n, tail_weights, blend_mark
     ws_summary.append(['Note on pruning', 'Normalized after pruning topN'])
     ws_summary.append(['Note on coverage', '% of eligible eval users not using popularity backoff (eval on all, train may be sampled)'])
     ws_summary.append(['Note on determinism', 'ties → blended desc, Markov desc, popularity desc, product_id asc'])
+    ws_summary.append(['CLI notes', 'Try --no_repeats, --sample_rate, --max_orders, --strict_order_check'])
 
     ws_summary.append([])
     ws_summary.append(['Params', ''])
