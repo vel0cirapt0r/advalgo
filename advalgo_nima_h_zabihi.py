@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from collections import defaultdict
 import time
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 
 # Load data and prepare sequences
@@ -59,7 +59,7 @@ def build_model(train_df, alpha=0.1, top_n=100, window=5):
     # Co-visitation (symmetric within window)
     co_vis_counts = defaultdict(lambda: defaultdict(float))
     order_groups = train_df.groupby('order_id')
-    num_groups = len(order_groups)
+    num_groups = train_df['order_id'].nunique()
     processed = 0
     for name, g in order_groups:
         products = g['product_id'].values
@@ -69,7 +69,7 @@ def build_model(train_df, alpha=0.1, top_n=100, window=5):
             for j in range(i + 1, min(i + window + 1, n)):
                 dist = j - i
                 weight = 1.0 / dist
-                # Forward boost if target reordered > 0
+                # Forward boost if target reordered > 0 (NaN filled as 0 in load_data)
                 boost_fwd = 1.15 if reords[j] > 0 else 1.0
                 co_vis_counts[products[i]][products[j]] += weight * boost_fwd
                 # Reverse boost if target reordered > 0
@@ -103,14 +103,15 @@ def build_model(train_df, alpha=0.1, top_n=100, window=5):
 
 
 # Predict next item
-def predict_next(transitions, co_vis, popularity, sequence):
+def predict_next(transitions, co_vis, popularity, sequence, tail_weights, blend_markov, blend_cov):
     if len(sequence) == 0:
         if not popularity:
-            return None
-        return max(popularity, key=popularity.get)
+            return None, 0, 0.0
+        pred = max(popularity, key=popularity.get)
+        return pred, 0, popularity.get(pred, 0.0)
 
     tail = sequence[-3:]  # oldest to newest
-    weights = [0.3, 0.6, 1.0][-len(tail):]  # weights correspond to tail order: lower for older, higher for newer
+    weights = tail_weights[-len(tail):]  # weights correspond to tail order: lower for older, higher for newer
 
     candidates = set()
     markov_scores = defaultdict(float)
@@ -147,9 +148,9 @@ def predict_next(transitions, co_vis, popularity, sequence):
     for j in candidates:
         s_markov = markov_scores.get(j, 0.0)
         s_co = co_scores.get(j, 0.0)
-        scores[j] = 0.6 * s_markov + 0.4 * s_co
+        scores[j] = blend_markov * s_markov + blend_cov * s_co
 
-    # For determinism: sort by score desc, then markov desc, then pop desc, then product_id asc
+    # For determinism: sort by blended score desc, then markov desc, then popularity desc, then product_id asc
     sorted_candidates = sorted(scores.items(),
                                key=lambda x: (-x[1], -markov_scores.get(x[0], 0), -popularity.get(x[0], 0), x[0]))
     predicted = sorted_candidates[0][0]
@@ -160,7 +161,7 @@ def predict_next(transitions, co_vis, popularity, sequence):
 
 
 # Evaluate for a given k
-def evaluate(sequences, transitions, co_vis, popularity, k):
+def evaluate(sequences, transitions, co_vis, popularity, k, tail_weights, blend_markov, blend_cov):
     correct = 0
     total = 0
     num_backoff = 0
@@ -170,7 +171,8 @@ def evaluate(sequences, transitions, co_vis, popularity, k):
         if len(seq) > k:
             input_seq = seq[:-k]
             true_last = seq[-1]
-            predicted, num_cand, pred_score = predict_next(transitions, co_vis, popularity, input_seq)
+            predicted, num_cand, pred_score = predict_next(transitions, co_vis, popularity, input_seq, tail_weights,
+                                                           blend_markov, blend_cov)
             if predicted is None:
                 continue
             used_backoff = num_cand == 0
@@ -225,7 +227,8 @@ def main(file_path, output_excel):
         # Build train_df from prefixes
         train_start = time.time()
         train_groups = [g.iloc[:-k] for name, g in df.groupby('order_id') if len(g) > k]
-        skipped = len(sequences) - len(train_groups)
+        eligible = len(train_groups)
+        skipped = len(sequences) - eligible
         if not train_groups:
             continue
         train_df = pd.concat(train_groups)
@@ -236,7 +239,8 @@ def main(file_path, output_excel):
 
         # Evaluate
         eval_start = time.time()
-        acc, preds, eligible, num_backoff, correct_k = evaluate(sequences, transitions, co_vis, popularity, k)
+        acc, preds, _, num_backoff, correct_k = evaluate(sequences, transitions, co_vis, popularity, k, tail_weights,
+                                                         blend_markov, blend_cov)
         eval_time = time.time() - eval_start
         total_eval_time += eval_time
 
@@ -251,19 +255,21 @@ def main(file_path, output_excel):
 
         metrics_per_k[k] = {
             'eligible_users': eligible,
+            'skipped_users': skipped,
+            'correct_predictions': correct_k,
             'num_backoff': num_backoff,
             'coverage_model_%': coverage_model,
             'train_time_s': train_time,
             'eval_time_s': eval_time,
+            'num_products_train': V_train,
+            'num_orders_train': num_orders_train,
+            'avg_seq_len_train': avg_seq_len_train,
             'topN_pruning': top_n,
             'alpha': alpha,
             'blend_markov': blend_markov,
             'blend_cov': blend_cov,
             'tail_weights': str(tail_weights),
-            'window': window,
-            'num_products_train': V_train,
-            'num_orders_train': num_orders_train,
-            'avg_seq_len_train': avg_seq_len_train
+            'window': window
         }
 
         all_predictions.extend(preds)
@@ -272,8 +278,8 @@ def main(file_path, output_excel):
 
     macro_acc = np.mean(list(results.values()))
     micro_acc = total_correct / total_eligible if total_eligible > 0 else 0
-    results['Overall accuracy (macro)'] = macro_acc
-    results['Overall accuracy (micro)'] = micro_acc
+    results['Overall accuracy (macro – mean of per-k)'] = macro_acc
+    results['Overall accuracy (micro – global)'] = micro_acc
 
     # Write to Excel
     write_start = time.time()
@@ -281,12 +287,14 @@ def main(file_path, output_excel):
     ws_summary = wb.active
     ws_summary.title = 'Summary'
     ws_summary.append(['Metric', 'Value'])
+    ws_summary.append(['Dataset rows', len(df)])
+    ws_summary.append(['Total orders', len(sequences)])
     for key, val in results.items():
         ws_summary.append([key, val])
     ws_summary.append(['Load time', load_time])
     ws_summary.append(['Total train time', total_train_time])
     ws_summary.append(['Total eval time', total_eval_time])
-    ws_summary.append(['Write time', ''])  # Placeholder, update later
+    ws_summary.append(['Write time', ''])  # Placeholder
 
     # Params block
     ws_summary.append([])
@@ -318,7 +326,7 @@ def main(file_path, output_excel):
     write_time = time.time() - write_start
 
     # Update write time in summary
-    wb = Workbook(output_excel)  # Reload to update
+    wb = load_workbook(output_excel)
     ws_summary = wb['Summary']
     for row in ws_summary.iter_rows():
         if row[0].value == 'Write time':
